@@ -11,6 +11,7 @@ import json
 import os
 import tempfile
 import shutil
+from pathlib import Path
 
 import pytest
 
@@ -152,6 +153,133 @@ def test_handle_approve_all(hermes_home):
     assert "Approved 2" in out
     assert wa.pending_count("memory") == 0
     assert len(store.user_entries) == 2
+
+
+def test_working_context_candidate_uses_host_approval_without_builtin_write(hermes_home):
+    from hermes_cli.write_approval_commands import handle_pending_subcommand
+    from tools.memory_tool import MemoryStore
+    from tools import write_approval as wa
+
+    store = MemoryStore()
+    manager_calls = []
+
+    class CandidateManager:
+        def approve_pending_candidate(self, provider_name, candidate_id, approval):
+            manager_calls.append((provider_name, candidate_id, approval))
+            return {"success": True, "status": "active"}
+
+    record = wa.stage_write(
+        "memory",
+        {
+            "action": "working_context_candidate",
+            "provider": "local-sqlite-memory",
+            "candidate_id": 42,
+            "content": "Temporary candidate preview.",
+            "source_ref": "working-context:hve-cfo:entry-42",
+            "source_record_hash": "a" * 64,
+            "target_memory_hash": "b" * 64,
+        },
+        summary="Review candidate",
+        origin="foreground",
+    )
+
+    pending = handle_pending_subcommand(wa.MEMORY, ["pending"])
+    assert "Temporary candidate preview." in pending
+    out = handle_pending_subcommand(
+        wa.MEMORY,
+        ["approve", record["id"]],
+        memory_store=store,
+        memory_manager=CandidateManager(),
+    )
+
+    assert "Approved 1 memory write(s)." in out
+    assert wa.pending_count("memory") == 0
+    assert store.memory_entries == []
+    provider_name, candidate_id, approval = manager_calls[0]
+    assert (provider_name, candidate_id) == ("local-sqlite-memory", "42")
+    assert approval["approver"] == "interactive-host"
+    assert approval["approval_reference"] == record["id"]
+    assert approval["source_record_hash"] == "a" * 64
+    assert approval["target_memory_hash"] == "b" * 64
+
+
+def test_working_context_candidate_fails_closed_without_active_provider(hermes_home, monkeypatch):
+    from hermes_cli.write_approval_commands import handle_pending_subcommand
+    from tools.memory_tool import MemoryStore
+    from tools import write_approval as wa
+
+    record = wa.stage_write(
+        "memory",
+        {
+            "action": "working_context_candidate",
+            "provider": "local-sqlite-memory",
+            "candidate_id": 42,
+            "content": "Candidate remains unpromoted.",
+            "source_ref": "working-context:hve-cfo:entry-42",
+            "source_record_hash": "a" * 64,
+            "target_memory_hash": "b" * 64,
+        },
+        summary="Review candidate",
+        origin="foreground",
+    )
+    monkeypatch.setattr("tools.memory_tool.load_on_disk_memory_manager", lambda: None)
+    store = MemoryStore()
+
+    out = handle_pending_subcommand(
+        wa.MEMORY,
+        ["approve", record["id"]],
+        memory_store=store,
+    )
+
+    assert "Approved 0 memory write(s)." in out
+    assert "active external memory provider unavailable" in out
+    assert wa.get_pending("memory", record["id"]) is not None
+    assert store.memory_entries == []
+
+
+def test_on_disk_approval_manager_binds_to_the_named_active_profile(hermes_home, monkeypatch):
+    from tools.memory_tool import load_on_disk_memory_manager
+
+    profile_home = Path(hermes_home) / "profiles" / "hve-cfo"
+    profile_home.mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", lambda: Path(hermes_home).parent)
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    config = {"memory": {"provider": "external"}}
+    monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: config)
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: config)
+
+    class Provider:
+        name = "external"
+
+        def __init__(self):
+            self.init_kwargs = None
+
+        def is_available(self):
+            return True
+
+        def unavailable_reason(self):
+            return ""
+
+        def get_tool_schemas(self):
+            return []
+
+        def initialize(self, session_id, **kwargs):
+            self.init_kwargs = {"session_id": session_id, **kwargs}
+
+        def shutdown(self):
+            pass
+
+    provider = Provider()
+    monkeypatch.setattr("plugins.memory.load_memory_provider", lambda *_args, **_kwargs: provider)
+
+    manager = load_on_disk_memory_manager()
+    try:
+        assert manager is not None
+        assert provider.init_kwargs["hermes_home"] == str(profile_home.resolve())
+        assert provider.init_kwargs["agent_identity"] == "hve-cfo"
+    finally:
+        manager.shutdown_all()
+
 
 def test_handle_approve_surfaces_overwritten_entry(hermes_home):
     """#117952: on the /memory approve surface a partial-entry replace must show the

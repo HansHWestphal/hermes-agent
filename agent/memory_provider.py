@@ -219,6 +219,14 @@ class MemoryProvider(ABC):
         callers may omit this field: ``old_text`` alone is not authoritative identity.
         """
 
+    def approve_pending_candidate(self, candidate_id: str, approval: dict[str, Any]) -> dict[str, Any]:
+        """Apply a host-approved provider candidate from the native review command.
+
+        This hook is called by Hermes' host-side ``/memory approve`` handler only; it is
+        deliberately separate from model-callable provider tools.
+        """
+        raise NotImplementedError(f"Provider {self.name} does not support host-approved candidates")
+
     def backup_paths(self) -> list[str]:
         """Absolute paths of provider state OUTSIDE HERMES_HOME for ``hermes backup``/``import``
         (paths outside the home dir are skipped). MUST work without ``initialize()`` or network."""

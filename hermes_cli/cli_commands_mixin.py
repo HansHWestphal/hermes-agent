@@ -1294,8 +1294,8 @@ class CLICommandsMixin(CLICommandsSessionToolsMixin):
         """Handle /memory slash command — pending review + approval-gate toggle."""
         from hermes_cli.write_approval_commands import handle_pending_subcommand
         from tools import write_approval as wa
-        args = cmd.strip().split()[1:]
-        store = getattr(self.agent, "_memory_store", None) if getattr(self, "agent", None) else None
+        args, agent = cmd.strip().split()[1:], getattr(self, "agent", None)
+        store, memory_manager = getattr(agent, "_memory_store", None), getattr(agent, "_memory_manager", None)
         if store is None:
             # No live agent store (e.g. Desktop GUI): use a fresh on-disk store, as the gateway
             # does — same MEMORY/USER.md, same configured char limits.
@@ -1306,7 +1306,7 @@ class CLICommandsMixin(CLICommandsSessionToolsMixin):
             from tools.memory_tool import load_on_disk_store
             store = load_on_disk_store()
         out = handle_pending_subcommand(
-            wa.MEMORY, args, memory_store=store,
+            wa.MEMORY, args, memory_store=store, memory_manager=memory_manager,
             set_mode_fn=lambda enabled: self._save_write_approval("memory", enabled))
         print(out if out is not None else _t("memory.unknown_subcommand"))
 

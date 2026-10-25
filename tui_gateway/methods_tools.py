@@ -960,6 +960,7 @@ def _run_pending_review(rid, subsystem: str, arg: str, session, *, unknown: str)
     out = handle_pending_subcommand(
         subsystem, (arg or "").split(),
         memory_store=_pending_subcommand_store(session) if subsystem == wa.MEMORY else None,
+        memory_manager=getattr(session.get("agent"), "_memory_manager", None) if session else None,
         set_mode_fn=_write_approval_mode_setter(subsystem))
     return _exec_out(rid, out if out is not None else unknown)
 

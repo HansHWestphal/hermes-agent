@@ -4,9 +4,17 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 from typing import List, Optional
 
 from tools import write_approval as wa
+
+
+def _working_context_candidate(record: dict) -> Optional[dict]:
+    payload = record.get("payload")
+    if not isinstance(payload, dict) or payload.get("action") != "working_context_candidate":
+        return None
+    return payload
 
 
 def _fmt_state(subsystem: str) -> str:
@@ -24,7 +32,12 @@ def _fmt_pending_list(subsystem: str) -> str:
         tag = " [auto]" if origin == "background_review" else ""
         lines.append(f"  {r['id']}{tag}  {r.get('summary', '')}")
         if subsystem == wa.MEMORY:
-            lines.extend(f"      {line}" for line in _matched_entries(r["payload"]))
+            candidate = _working_context_candidate(r)
+            if candidate:
+                lines.append(f"      Candidate content: {candidate.get('content', '<missing>')}")
+                lines.append(f"      Source: {candidate.get('source_ref', '<missing>')}")
+            else:
+                lines.extend(f"      {line}" for line in _matched_entries(r["payload"]))
     lines.append("")
     lines.append(f"Apply: /{subsystem} approve <id>   Reject: /{subsystem} reject <id>")
     if subsystem == wa.SKILLS:
@@ -33,13 +46,13 @@ def _fmt_pending_list(subsystem: str) -> str:
 
 
 def handle_pending_subcommand(
-    subsystem: str, args: list[str], *, memory_store=None, set_mode_fn=None) -> Optional[str]:
+    subsystem: str, args: list[str], *, memory_store=None, memory_manager=None, set_mode_fn=None
+) -> Optional[str]:
     """Dispatch a /memory or /skills write-approval subcommand.
 
-    ``memory_store`` applies approved memory writes (CLI passes its live store; gateway a freshly
-    loaded one); ``set_mode_fn`` persists the write_approval boolean. Returns text for the user,
-    or None when the args are not a write-approval subcommand so the caller falls through to its
-    other handling (e.g. /skills search).
+    ``memory_store`` applies built-in memory writes; ``memory_manager`` routes host-approved
+    provider candidates. When no live manager exists, candidate approval loads only the active
+    profile's configured provider. ``set_mode_fn`` persists the write_approval boolean.
     """
     if not args:
         return f"{_fmt_state(subsystem)}\n\n" + _fmt_pending_list(subsystem)
@@ -47,7 +60,7 @@ def handle_pending_subcommand(
     if sub == "pending":
         return _fmt_pending_list(subsystem)
     if sub in {"approve", "apply"}:
-        return _approve(subsystem, rest, memory_store)
+        return _approve(subsystem, rest, memory_store, memory_manager)
     if sub in {"reject", "deny", "drop"}:
         return _reject(subsystem, rest)
     if sub == "diff" and subsystem == wa.SKILLS:
@@ -61,7 +74,7 @@ def _usage(subsystem: str) -> str:
     return f"Usage: /{subsystem} approve|reject <id>  (or 'all')"
 
 
-def _approve(subsystem: str, rest: list[str], memory_store) -> str:
+def _approve(subsystem: str, rest: list[str], memory_store, memory_manager) -> str:
     if not rest:
         return _usage(subsystem)
     target = rest[0]
@@ -78,7 +91,7 @@ def _approve(subsystem: str, rest: list[str], memory_store) -> str:
 
     applied, failed, overwritten, patched, removed = 0, [], [], [], []
     for rec in targets:
-        ok, msg, result = _apply_one(subsystem, rec, memory_store)
+        ok, msg, result = _apply_one(subsystem, rec, memory_store, memory_manager)
         if ok:
             wa.discard_pending(subsystem, rec["id"])
             applied += 1
@@ -125,11 +138,42 @@ def _matched_entries(payload) -> list[str]:
             for op in destructive_ops(payload)]
 
 
-def _apply_one(subsystem: str, rec, memory_store):
+def _apply_one(subsystem: str, rec, memory_store, memory_manager):
     """``(ok, error, result)`` — *result* is the applier's full payload (empty on exceptions)."""
     payload = rec.get("payload", {})
     try:
         if subsystem == wa.MEMORY:
+            candidate = _working_context_candidate(rec)
+            if candidate is not None:
+                manager = memory_manager
+                owns_manager = False
+                if manager is None:
+                    from tools.memory_tool import load_on_disk_memory_manager
+                    manager = load_on_disk_memory_manager()
+                    owns_manager = manager is not None
+                if manager is None:
+                    return False, "active external memory provider unavailable", {}
+                approval = {
+                    "approver": "interactive-host",
+                    "approval_reference": rec["id"],
+                    "requested_action": "promote_working_context_candidate",
+                    "approved_at": datetime.now(UTC).isoformat(timespec="seconds"),
+                    "source_record_hash": candidate.get("source_record_hash"),
+                    "target_memory_hash": candidate.get("target_memory_hash"),
+                    "candidate_content": candidate.get("content"),
+                    "source_ref": candidate.get("source_ref"),
+                    "reason": "Approved through the native /memory review command.",
+                }
+                try:
+                    result = manager.approve_pending_candidate(
+                        str(candidate.get("provider", "")),
+                        str(candidate.get("candidate_id", "")),
+                        approval,
+                    )
+                finally:
+                    if owns_manager:
+                        manager.shutdown_all()
+                return bool(result.get("success")), result.get("error", ""), result
             if memory_store is None:
                 return False, "memory store unavailable", {}
             from tools.memory_tool import apply_memory_pending

@@ -31,6 +31,7 @@ class FakeMemoryProvider(MemoryProvider):
         self.session_end_called = False
         self.pre_compress_called = False
         self.memory_writes = []
+        self.pending_candidate_approvals = []
         self.shutdown_called = False
         self._prefetch_result = ""
         self._prompt_block = ""
@@ -80,6 +81,10 @@ class FakeMemoryProvider(MemoryProvider):
     def on_memory_write(self, action, target, content):
         self.memory_writes.append((action, target, content))
 
+    def approve_pending_candidate(self, candidate_id, approval):
+        self.pending_candidate_approvals.append((candidate_id, approval))
+        return {"success": True, "status": "active"}
+
 
 class MessagesMemoryProvider(FakeMemoryProvider):
     """Provider that opts into completed-turn message context."""
@@ -123,6 +128,26 @@ class BlockingPrefetchProvider(FakeMemoryProvider):
 
 
 class TestMemoryManager:
+    def test_host_candidate_approval_routes_to_the_named_profile_provider(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        manager = MemoryManager()
+        provider = FakeMemoryProvider("external")
+        manager.add_provider(provider)
+        manager.initialize_all(
+            session_id="host-review",
+            hermes_home=str(tmp_path),
+            agent_identity="test-profile",
+        )
+        approval = {"approval_reference": "pending-1"}
+
+        result = manager.approve_pending_candidate("external", "candidate-1", approval)
+
+        assert result == {"success": True, "status": "active"}
+        assert provider.pending_candidate_approvals == [("candidate-1", approval)]
+        with pytest.raises(RuntimeError, match="unavailable"):
+            manager.approve_pending_candidate("other-provider", "candidate-1", approval)
+        assert len(provider.pending_candidate_approvals) == 1
+
     def test_empty_manager(self):
         mgr = MemoryManager()
         assert mgr.providers == []

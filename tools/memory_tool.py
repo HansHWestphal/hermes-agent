@@ -61,6 +61,45 @@ def load_on_disk_store() -> MemoryStore:
     return store
 
 
+def load_on_disk_memory_manager():
+    """Load the configured external provider for a host-side candidate approval.
+
+    Unlike the built-in file-store fallback, this path fails closed when the active
+    profile or provider cannot be resolved; it must never approve against another home.
+    """
+    from agent.memory_manager import MemoryManager
+    from agent.memory_provider import is_core_memory_provider
+    from hermes_cli.config import cfg_get, load_config_readonly
+    from hermes_constants import profile_name_for_home
+    from plugins.memory import load_memory_provider
+
+    home = get_hermes_home().resolve()
+    profile_id = profile_name_for_home(home)
+    if not profile_id:
+        raise RuntimeError("active Hermes profile identity is unavailable")
+    provider_name = cfg_get(load_config_readonly(), "memory", "provider")
+    if is_core_memory_provider(provider_name):
+        return None
+    provider = load_memory_provider(str(provider_name), register_skills=False)
+    if provider is None:
+        raise RuntimeError(f"configured memory provider {provider_name!r} is unavailable")
+    if not provider.is_available():
+        raise RuntimeError(
+            f"configured memory provider {provider_name!r} is not available: "
+            f"{provider.unavailable_reason()}"
+        )
+    manager = MemoryManager()
+    manager.add_provider(provider)
+    manager.initialize_all(
+        session_id="host-memory-approval",
+        hermes_home=str(home),
+        agent_identity=profile_id,
+        platform="cli",
+        agent_context="primary",
+    )
+    return manager
+
+
 def _pin_matched_entries(store: MemoryStore, payload: dict[str, Any]) -> Optional[str]:
     """Record on each staged replace/remove the FULL entry its old_text selects now. Approval
     then applies to exactly the entry the approver reviewed and refuses if it changed:

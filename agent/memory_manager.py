@@ -760,6 +760,19 @@ class MemoryManager:
         external = [p for p in self._providers if p.name != "builtin"]
         self._each_provider("on_memory_write failed", _notify, providers=external)
 
+    def approve_pending_candidate(self, provider_name: str, candidate_id: str,
+                                  approval: dict[str, Any]) -> dict[str, Any]:
+        """Route an explicit host review to one profile-bound provider, never to model tools."""
+        if not self._owner_allows("approve_pending_candidate"):
+            raise PermissionError("memory candidate approval is outside the provider's active profile")
+        provider = next(
+            (item for item in self._providers if item.name == provider_name and item.name != "builtin"),
+            None,
+        )
+        if provider is None:
+            raise RuntimeError(f"active memory provider {provider_name!r} is unavailable")
+        return provider.approve_pending_candidate(candidate_id, approval)
+
     # Actions mirrored to external providers; non-mutating results (errors, staged) are
     # filtered by ``notify_memory_tool_write`` first.
     _MIRRORED_MEMORY_ACTIONS = {"add", "replace", "patch", "remove"}
