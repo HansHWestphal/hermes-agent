@@ -896,26 +896,94 @@ class GatewayAgentCacheMixin:
         Threads start with an EMPTY context, so a bare thread would commit end-of-session memory
         (provider ``on_session_end`` reads credentials/home at call time) under the launch profile.
         And the LRU-cap eviction runs inside the REQUESTING turn, whose agent may belong to another
-        profile — so "some scope is present" is not enough either. The owner comes from the session
-        key: a named profile's home, else the DEFAULT profile (``agent:main:`` keys), which is the
-        root Hermes dir even when the gateway was launched under a named profile. Its scope is
-        entered unless the current one already is the owner's."""
-        from agent.secret_scope import current_secret_scope, is_multiplex_active
+        profile — so "some scope is present" is not enough either. Multiplexed gateways resolve the
+        owner from the namespaced session key; standalone gateways use their captured launch home
+        because their legacy ``agent:main:`` keys are local to that profile."""
+        from agent.secret_scope import current_secret_scope_home
+        from hermes_constants import (
+            get_default_hermes_root, get_hermes_home_override, hermes_home_key, profile_name_for_home,
+        )
+
         scope = nullcontext()
-        if is_multiplex_active():
-            from gateway.run import _profile_runtime_scope
-            from hermes_constants import get_default_hermes_root, get_hermes_home, hermes_home_key
-            owner = None
-            store = getattr(self, "session_store", None)
-            if session_key and store is not None:
+        store = getattr(self, "session_store", None)
+        multiplex_profiles = bool(getattr(getattr(self, "config", None), "multiplex_profiles", False))
+        if multiplex_profiles:
+            if store is None or not session_key:
+                logger.error("Refusing profile-scoped release: session identity or session store is missing")
+                return
+            try:
+                profile = store._profile_from_session_key(session_key)
+            except Exception:
+                logger.warning("Could not resolve the profile encoded in %s; refusing release",
+                               session_key, exc_info=True)
+                return
+            if not profile:
+                logger.error("Refusing profile-scoped release: session key %s has no profile identity", session_key)
+                return
+
+            if profile == "default":
+                owner_home = get_default_hermes_root()
+            else:
                 try:
                     owner = store._profile_home_for_key(session_key)
                 except Exception:
-                    logger.warning("Could not resolve the owning profile for %s; releasing under the default profile",
+                    logger.warning("Could not resolve the owning profile for %s; refusing release",
                                    session_key, exc_info=True)
-            owner_home = Path(owner) if owner else get_default_hermes_root()
-            if current_secret_scope() is None or hermes_home_key(get_hermes_home()) != hermes_home_key(owner_home):
-                scope = _profile_runtime_scope(owner_home)
+                    return
+                if owner is None:
+                    logger.error("Refusing profile-scoped release: profile %s has no resolvable home", profile)
+                    return
+                owner_home = Path(owner)
+                if profile_name_for_home(owner_home) != profile:
+                    logger.error("Refusing profile-scoped release: key profile %s does not match home %s",
+                                 profile, owner_home)
+                    return
+        else:
+            if store is None or not session_key:
+                logger.error("Refusing standalone release: session identity or session store is missing")
+                return
+            try:
+                profile = store._profile_from_session_key(session_key)
+            except Exception:
+                logger.warning("Could not resolve the profile encoded in %s; refusing release",
+                               session_key, exc_info=True)
+                return
+            if not profile:
+                logger.error("Refusing standalone release: session key %s has no profile identity", session_key)
+                return
+            owner = getattr(store, "_routing_home", None)
+            if owner is None:
+                logger.error("Refusing standalone release: captured launch profile home is missing")
+                return
+            owner_home = Path(owner)
+            launch_profile = profile_name_for_home(owner_home)
+            if not launch_profile:
+                logger.error("Refusing standalone release: launch profile identity is unresolved for %s",
+                             owner_home)
+                return
+            if profile not in {"default", launch_profile}:
+                logger.error("Refusing standalone release: key profile %s does not match launch profile %s",
+                             profile, launch_profile)
+                return
+
+        try:
+            owner_key = hermes_home_key(owner_home)
+            if not owner_key or not owner_home.is_dir():
+                raise ValueError("profile home is missing or unresolvable")
+            current_secret_home = current_secret_scope_home()
+            current_home = get_hermes_home_override() or current_secret_home
+            current_matches = (
+                current_home is not None
+                and current_secret_home is not None
+                and hermes_home_key(current_home) == owner_key
+                and hermes_home_key(current_secret_home) == owner_key
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            logger.error("Refusing profile-scoped release for %s: %s", session_key, exc)
+            return
+        if not current_matches:
+            from gateway.run import _profile_runtime_scope
+            scope = _profile_runtime_scope(owner_home)
         with scope:
             target(*args)
 
